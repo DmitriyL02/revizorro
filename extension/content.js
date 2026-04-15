@@ -537,7 +537,7 @@
       for (let depth = 1; depth < parts.length; depth++) {
         const folder = parts.slice(0, depth).join('/');
         let s = stats.get(folder);
-        if (!s) { s = { added: 0, modified: 0, removed: 0 }; stats.set(folder, s); }
+        if (!s) { s = { added: 0, modified: 0, removed: 0, deletedFiles: [] }; stats.set(folder, s); }
         s[type]++;
       }
     };
@@ -548,7 +548,16 @@
       else if (prev !== source) bump(path, 'modified');
     }
     for (const [path] of previousMap) {
-      if (!currentMap.has(path)) bump(path, 'removed');
+      if (!currentMap.has(path)) {
+        bump(path, 'removed');
+        // Добавляем имя файла только в непосредственную родительскую папку
+        const lastSlash = path.lastIndexOf('/');
+        if (lastSlash >= 0) {
+          const parentFolder = path.substring(0, lastSlash);
+          const s = stats.get(parentFolder);
+          if (s) s.deletedFiles.push(path.substring(lastSlash + 1));
+        }
+      }
     }
 
     return stats;
@@ -583,10 +592,10 @@
     const stats = computeFolderStats();
     if (stats.size === 0) return;
 
+    document.querySelectorAll('.revizorro-deleted-summary').forEach(el => el.remove());
+
     const titleElements = document.querySelectorAll('.source-tree__folder-title');
     for (const titleEl of titleElements) {
-      if (titleEl.querySelector('.revizorro-folder-stats')) continue;
-
       const folderPath = getFolderPath(titleEl);
       if (!folderPath) continue;
 
@@ -598,37 +607,78 @@
       }
       if (!s || (s.added === 0 && s.modified === 0 && s.removed === 0)) continue;
 
-      const badge = document.createElement('span');
-      badge.className = 'revizorro-folder-stats revizorro-injected';
+      // Бейдж — создаём один раз
+      if (!titleEl.querySelector('.revizorro-folder-stats')) {
+        const badge = document.createElement('span');
+        badge.className = 'revizorro-folder-stats revizorro-injected';
 
-      if (s.added > 0) {
-        const sp = document.createElement('span');
-        sp.className = 'revizorro-stat-added';
-        sp.textContent = '+' + s.added;
-        badge.appendChild(sp);
-      }
-      if (s.modified > 0) {
-        if (badge.childNodes.length > 0) badge.appendChild(document.createTextNode(' '));
-        const sp = document.createElement('span');
-        sp.className = 'revizorro-stat-modified';
-        sp.textContent = '~' + s.modified;
-        badge.appendChild(sp);
-      }
-      if (s.removed > 0) {
-        if (badge.childNodes.length > 0) badge.appendChild(document.createTextNode(' '));
-        const sp = document.createElement('span');
-        sp.className = 'revizorro-stat-removed';
-        sp.textContent = '-' + s.removed;
-        badge.appendChild(sp);
+        if (s.added > 0) {
+          const sp = document.createElement('span');
+          sp.className = 'revizorro-stat-added';
+          sp.textContent = '+' + s.added;
+          badge.appendChild(sp);
+        }
+        if (s.modified > 0) {
+          if (badge.childNodes.length > 0) badge.appendChild(document.createTextNode(' '));
+          const sp = document.createElement('span');
+          sp.className = 'revizorro-stat-modified';
+          sp.textContent = '~' + s.modified;
+          badge.appendChild(sp);
+        }
+        if (s.removed > 0) {
+          if (badge.childNodes.length > 0) badge.appendChild(document.createTextNode(' '));
+          const sp = document.createElement('span');
+          sp.className = 'revizorro-stat-removed';
+          sp.textContent = '-' + s.removed;
+          badge.appendChild(sp);
+        }
+
+        const folderNameEl = titleEl.querySelector('.source-tree__folder-name');
+        if (folderNameEl) {
+          folderNameEl.insertAdjacentElement('afterend', badge);
+        } else {
+          titleEl.appendChild(badge);
+        }
       }
 
-      const folderNameEl = titleEl.querySelector('.source-tree__folder-name');
-      if (folderNameEl) {
-        folderNameEl.insertAdjacentElement('afterend', badge);
-      } else {
-        titleEl.appendChild(badge);
+      // Виджет удалённых файлов — показываем когда папка раскрыта
+      if (s.deletedFiles && s.deletedFiles.length > 0) {
+        const folderContainer = titleEl.parentElement;
+        if (folderContainer && !folderContainer.querySelector('.revizorro-deleted-summary')) {
+          const firstFile = folderContainer.querySelector('.source-tree__file');
+          if (firstFile) {
+            const widget = createDeletedWidget(s.deletedFiles);
+            firstFile.parentElement.insertBefore(widget, firstFile);
+          }
+        }
       }
     }
+  }
+
+  function createDeletedWidget(fileNames) {
+    const container = document.createElement('div');
+    container.className = 'revizorro-deleted-summary revizorro-injected';
+
+    const list = document.createElement('div');
+    list.className = 'revizorro-deleted-list';
+    for (const name of fileNames) {
+      const item = document.createElement('div');
+      item.className = 'revizorro-deleted-item';
+      item.textContent = name;
+      list.appendChild(item);
+    }
+
+    const header = document.createElement('div');
+    header.className = 'revizorro-deleted-header';
+    header.textContent = '\u2212 ' + fileNames.length + ' ' + pluralFiles(fileNames.length) + ' удалено';
+    header.addEventListener('click', () => {
+      list.classList.toggle('revizorro-deleted-list--open');
+      header.classList.toggle('revizorro-deleted-header--open');
+    });
+
+    container.appendChild(header);
+    container.appendChild(list);
+    return container;
   }
 
   function applyFileBadges() {
@@ -690,7 +740,6 @@
     }
 
     applyFolderBadges();
-    showDeletedFilesSummary(currentMap, previousMap);
   }
 
   function pluralFiles(n) {
@@ -701,45 +750,6 @@
     return 'файлов';
   }
 
-  function showDeletedFilesSummary(currentMap, previousMap) {
-    if (document.querySelector('.revizorro-deleted-summary')) return;
-
-    const deletedFiles = [];
-    for (const [path] of previousMap) {
-      if (!currentMap.has(path)) {
-        deletedFiles.push(path);
-      }
-    }
-
-    if (deletedFiles.length === 0) return;
-
-    const sourceTree = document.querySelector('.source-tree');
-    if (!sourceTree) return;
-
-    const container = document.createElement('div');
-    container.className = 'revizorro-deleted-summary revizorro-injected';
-
-    const header = document.createElement('div');
-    header.className = 'revizorro-deleted-header';
-    header.textContent = '\u2212 ' + deletedFiles.length + ' ' + pluralFiles(deletedFiles.length) + ' удалено';
-    header.addEventListener('click', () => {
-      list.classList.toggle('revizorro-deleted-list--open');
-      header.classList.toggle('revizorro-deleted-header--open');
-    });
-
-    const list = document.createElement('div');
-    list.className = 'revizorro-deleted-list';
-    for (const filePath of deletedFiles) {
-      const item = document.createElement('div');
-      item.className = 'revizorro-deleted-item';
-      item.textContent = filePath;
-      list.appendChild(item);
-    }
-
-    container.appendChild(header);
-    container.appendChild(list);
-    sourceTree.appendChild(container);
-  }
 
   function removeDiffHighlights() {
     isApplyingDiff = true;
@@ -802,14 +812,18 @@
           }
         }
         for (const node of mutation.removedNodes) {
-          if (node.nodeType === 1 && (
-            node.classList?.contains('source-tree__code') ||
-            node.classList?.contains('source-tree__source')
-          )) {
+          if (node.nodeType !== 1) continue;
+          if (node.classList?.contains('source-tree__code') ||
+              node.classList?.contains('source-tree__source')) {
             const fileEl = mutation.target.closest?.('.source-tree__file');
             if (fileEl) {
               delete fileEl.dataset.revizorroDiffApplied;
             }
+          }
+          if (node.classList?.contains('source-tree__file') ||
+              node.classList?.contains('source-tree__dir') ||
+              node.querySelector?.('.source-tree__file')) {
+            hasNewFiles = true;
           }
         }
       }
