@@ -176,6 +176,8 @@
   letter-spacing: 0.02em;
   vertical-align: middle;
   background: rgba(107, 114, 128, 0.06);
+  flex-shrink: 0;
+  width: fit-content;
 }
 
 .revizorro-stat-added {
