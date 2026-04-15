@@ -3,6 +3,8 @@
   "name": "Revizorro Diff",
   "version": "0.1.0",
   "description": "Подсветка diff между итерациями ревью на платформе Яндекс Практикум",
+  "author": "Лацис Дмитрий",
+  "homepage_url": "https://github.com/DmitriyL02/revizorro",
   "permissions": ["storage", "activeTab"],
   "content_scripts": [
     {
