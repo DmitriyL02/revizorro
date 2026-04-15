@@ -664,7 +664,9 @@
 
     const header = document.createElement('div');
     header.className = 'revizorro-deleted-header';
-    header.textContent = '\u2212 ' + fileNames.length + ' ' + pluralFiles(fileNames.length) + ' удалено';
+    const n = fileNames.length;
+    const deleted = (n % 10 === 1 && n % 100 !== 11) ? 'удалён' : 'удалено';
+    header.textContent = '\u2212 ' + n + ' ' + pluralFiles(n) + ' ' + deleted;
     header.addEventListener('click', () => {
       list.classList.toggle('revizorro-deleted-list--open');
       header.classList.toggle('revizorro-deleted-header--open');
