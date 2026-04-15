@@ -1,5 +1,4 @@
 // Revizorro Diff — Content Script
-// Добавляет inline diff-подсветку между итерациями ревью
 
 (function () {
   'use strict';
@@ -7,18 +6,17 @@
   const DIFF_ENABLED_KEY = 'revizorro_diff_enabled';
   const DEBUG = false;
   let diffEnabled = false;
-  let pageData = null; // { current: [{file, source}], previous: [{file, source}], iteration: number }
-  let diffCache = new Map(); // filename → diff result
+  let pageData = null;
+  let diffCache = new Map();
   let observer = null;
-  let isApplyingDiff = false; // guard от повторного входа в apply/remove
+  let isApplyingDiff = false;
   let observerDebounceTimer = null;
 
-  // Кешированные индексы для быстрого поиска файлов
-  let currentFileMap = null;   // path → source
-  let previousFileMap = null;  // path → source
-  let currentBySuffix = null;  // suffix → {file, source}
-  let previousBySuffix = null; // suffix → {file, source}
-  let badgeMaps = null;        // кеш для applyFileBadges
+  let currentFileMap = null;
+  let previousFileMap = null;
+  let currentBySuffix = null;
+  let previousBySuffix = null;
+  let badgeMaps = null;
 
   function buildFileMaps() {
     if (!pageData) return;
@@ -36,7 +34,7 @@
         previousBySuffix.set(s.file, s);
       }
     }
-    badgeMaps = null; // инвалидируем кеш бейджей
+    badgeMaps = null;
   }
 
   function getBadgeMaps() {
@@ -72,9 +70,7 @@
     badgeMaps = null;
   }
 
-  // ═══════════════════════════════════════════
-  // 1. Извлечение данных из страницы
-  // ═══════════════════════════════════════════
+  // === Извлечение данных из страницы ===
 
   function extractPageData() {
     const scripts = document.querySelectorAll('script');
@@ -82,26 +78,21 @@
       const text = script.textContent;
       if (!text.includes('__init__.default(')) continue;
 
-      // Не используем regex на 7MB+ строке — ищем подстрокой
       const marker = '__init__.default({}, ';
       const startIdx = text.indexOf(marker);
       if (startIdx < 0) continue;
 
       const jsonStart = startIdx + marker.length;
-      // JSON заканчивается перед ", false)" или ", true)"
-      // Ищем с конца строки
       let endIdx = text.lastIndexOf(', false)');
       if (endIdx < 0) endIdx = text.lastIndexOf(', true)');
       if (endIdx < 0) continue;
 
       try {
         let jsonStr = text.substring(jsonStart, endIdx);
-        // Заменяем JS undefined на null для валидного JSON
         jsonStr = jsonStr.replace(/:\s*undefined/g, ': null');
         jsonStr = jsonStr.replace(/,\s*undefined/g, ', null');
 
         const data = JSON.parse(jsonStr);
-
         if (!data.apiData) return null;
 
         const homework = data.apiData.homework;
@@ -113,7 +104,6 @@
         const currentSources = homework.data.sources;
         const iteration = currentReview ? currentReview.iteration : null;
 
-        // Фильтруем history: убираем записи, совпадающие с текущей по id
         const filteredHistory = [];
         if (history) {
           for (let i = 0; i < history.length; i++) {
@@ -127,14 +117,11 @@
           }
         }
 
-        // Предыдущая итерация — первая в отфильтрованном списке (самая свежая)
         const previousSources = filteredHistory.length > 0 ? filteredHistory[0].data.sources : null;
         if (DEBUG && previousSources) {
           console.log('[Revizorro Diff] Предыдущая итерация: files=' + previousSources.length);
         }
 
-        // Собираем все итерации для селектора (от старой к новой, без текущей)
-        // Не копируем sources — храним ссылку на history entry
         const allIterations = [];
         for (let i = filteredHistory.length - 1; i >= 0; i--) {
           allIterations.push({
@@ -157,9 +144,7 @@
     return null;
   }
 
-  // ═══════════════════════════════════════════
-  // 2. Diff-алгоритм (line-based LCS)
-  // ═══════════════════════════════════════════
+  // === Diff-алгоритм (line-based LCS) ===
 
   function computeLineDiff(oldText, newText) {
     const oldLines = (oldText || '').split('\n');
@@ -172,18 +157,14 @@
     if (n === 0) return newLines.map((l, i) => ({ type: 'added', line: l, newNum: i + 1 }));
     if (m === 0) return oldLines.map((l, i) => ({ type: 'removed', line: l, oldNum: i + 1 }));
 
-    // Простой LCS через DP для файлов до ~1000 строк
-    // Для больших файлов используем линейный подход
+    // Для больших файлов — приблизительный diff
     if (n * m > 2_000_000) {
       return simpleDiff(oldLines, newLines);
     }
 
-    // LCS DP — rolling two rows (O(m) memory instead of O(n*m))
+    // LCS DP — rolling two rows, direction table for backtrack
     let prev = new Uint32Array(m + 1);
     let curr = new Uint32Array(m + 1);
-
-    // Для backtrack нужна полная таблица направлений — O(n*m) bytes (1 byte per cell)
-    // 0 = from top, 1 = from left, 2 = diagonal match
     const dir = new Array(n + 1);
     for (let i = 0; i <= n; i++) {
       dir[i] = new Uint8Array(m + 1);
@@ -203,13 +184,11 @@
           dir[i][j] = 1;
         }
       }
-      // swap rows
       const tmp = prev;
       prev = curr;
       curr = tmp;
     }
 
-    // Backtrack using direction table
     const result = [];
     let i = n, j = m;
     while (i > 0 || j > 0) {
@@ -228,8 +207,6 @@
     return result.reverse();
   }
 
-  // Fallback для очень больших файлов (приблизительный результат:
-  // одинаковые строки вроде пустых или "}" могут ложно считаться context)
   function simpleDiff(oldLines, newLines) {
     const oldSet = new Set(oldLines);
     const newSet = new Set(newLines);
@@ -266,17 +243,12 @@
 
     if (currentSource === undefined && previousSource === undefined) return null;
 
-    const diff = computeLineDiff(
-      previousSource || '',
-      currentSource || ''
-    );
+    const diff = computeLineDiff(previousSource || '', currentSource || '');
     diffCache.set(filename, diff);
     return diff;
   }
 
-  // ═══════════════════════════════════════════
-  // 3. UI — Toggle кнопка + селектор итерации
-  // ═══════════════════════════════════════════
+  // === UI — Toggle + селектор итерации ===
 
   function switchToIteration(sources) {
     removeDiffHighlights();
@@ -291,23 +263,19 @@
   function createToggleButton() {
     if (document.getElementById('revizorro-diff-toggle')) return;
 
-    // --- Контейнер ---
     const container = document.createElement('div');
     container.id = 'revizorro-diff-container';
     container.className = 'revizorro-diff-container';
 
-    // --- Лейбл «Diff» ---
     const label = document.createElement('span');
     label.className = 'revizorro-diff-label';
     label.textContent = 'Diff';
 
-    // --- iOS Toggle ---
     const toggle = document.createElement('button');
     toggle.id = 'revizorro-diff-toggle';
     toggle.className = 'revizorro-toggle';
     toggle.title = 'Показать/скрыть diff между итерациями';
 
-    // --- Селектор итерации ---
     const select = document.createElement('select');
     select.id = 'revizorro-iteration-select';
     select.className = 'revizorro-select';
@@ -339,13 +307,12 @@
     selectWrapper.className = 'revizorro-select-wrapper';
     selectWrapper.appendChild(select);
 
-    // --- Toggle handler ---
     toggle.addEventListener('click', () => {
       diffEnabled = !diffEnabled;
       container.classList.toggle('revizorro-diff-container--active', diffEnabled);
       toggle.classList.toggle('revizorro-toggle--on', diffEnabled);
       selectWrapper.classList.toggle('revizorro-select-wrapper--visible', diffEnabled);
-      chrome.storage.local.set({ [DIFF_ENABLED_KEY]: diffEnabled });
+      try { chrome.storage.local.set({ [DIFF_ENABLED_KEY]: diffEnabled }); } catch (e) { /* context invalidated */ }
       if (diffEnabled) {
         setupObserver();
         applyDiffToVisibleFiles();
@@ -359,7 +326,6 @@
     container.appendChild(toggle);
     container.appendChild(selectWrapper);
 
-    // Вставляем контейнер рядом с табами
     const insertButton = () => {
       const tabsGroup = document.querySelector('.tabs-group-default, .tabs-group');
       if (tabsGroup) {
@@ -376,7 +342,7 @@
 
     if (!insertButton()) {
       let attempts = 0;
-      const maxAttempts = 20; // 20 * 500ms = 10s
+      const maxAttempts = 20;
       const waitForTabs = setInterval(() => {
         if (insertButton() || ++attempts >= maxAttempts) {
           clearInterval(waitForTabs);
@@ -384,25 +350,24 @@
       }, 500);
     }
 
-    // Восстанавливаем состояние
-    chrome.storage.local.get(DIFF_ENABLED_KEY, (result) => {
-      if (result[DIFF_ENABLED_KEY]) {
-        diffEnabled = true;
-        container.classList.add('revizorro-diff-container--active');
-        toggle.classList.add('revizorro-toggle--on');
-        selectWrapper.classList.add('revizorro-select-wrapper--visible');
-        setupObserver();
-        applyDiffToVisibleFiles();
-      }
-    });
+    try {
+      chrome.storage.local.get(DIFF_ENABLED_KEY, (result) => {
+        if (chrome.runtime.lastError) return;
+        if (result[DIFF_ENABLED_KEY]) {
+          diffEnabled = true;
+          container.classList.add('revizorro-diff-container--active');
+          toggle.classList.add('revizorro-toggle--on');
+          selectWrapper.classList.add('revizorro-select-wrapper--visible');
+          setupObserver();
+          applyDiffToVisibleFiles();
+        }
+      });
+    } catch (e) { /* context invalidated */ }
   }
 
-  // ═══════════════════════════════════════════
-  // 4. Подсветка diff в DOM
-  // ═══════════════════════════════════════════
+  // === Подсветка diff в DOM ===
 
   function getFullFilePath(fileElement) {
-    // Собираем полный путь из родительских папок
     const parts = [];
     const nameEl = fileElement.querySelector('.source-tree__file-name');
     if (!nameEl) return null;
@@ -426,10 +391,8 @@
 
   function findMatchingSourceFile(partialPath) {
     if (!currentFileMap) return null;
-    // Точное совпадение — O(1)
     if (currentFileMap.has(partialPath)) return partialPath;
     if (previousFileMap && previousFileMap.has(partialPath)) return partialPath;
-    // По суффиксу — O(N) fallback, но только если exact не сработал
     for (const [path] of currentFileMap) {
       if (path.endsWith('/' + partialPath)) return path;
     }
@@ -563,9 +526,11 @@
     return el;
   }
 
+  // === Бейджи на папках и файлах ===
+
   function computeFolderStats() {
     const { currentMap, previousMap } = getBadgeMaps();
-    const stats = new Map(); // folderPrefix → {added, modified, removed}
+    const stats = new Map();
 
     const bump = (filePath, type) => {
       const parts = filePath.split('/');
@@ -590,7 +555,6 @@
   }
 
   function getFolderPath(titleEl) {
-    // Строим путь папки, поднимаясь от .source-tree__folder-title вверх
     const parts = [];
     const ownName = titleEl.querySelector('.source-tree__folder-name');
     if (!ownName) return null;
@@ -626,7 +590,6 @@
       const folderPath = getFolderPath(titleEl);
       if (!folderPath) continue;
 
-      // Ищем совпадение: точное или по суффиксу
       let s = stats.get(folderPath);
       if (!s) {
         for (const [key, val] of stats) {
@@ -659,7 +622,12 @@
         badge.appendChild(sp);
       }
 
-      titleEl.appendChild(badge);
+      const folderNameEl = titleEl.querySelector('.source-tree__folder-name');
+      if (folderNameEl) {
+        folderNameEl.insertAdjacentElement('afterend', badge);
+      } else {
+        titleEl.appendChild(badge);
+      }
     }
   }
 
@@ -709,14 +677,11 @@
       }
 
       if (badgeType) {
-        const titleEl = fileEl.querySelector('.source-tree__file-title');
-        if (titleEl) {
-          const badge = document.createElement('span');
-          badge.className = 'revizorro-badge revizorro-badge--' + badgeType;
-          badge.textContent = badgeType === 'added' ? 'новый' : badgeType === 'removed' ? 'удалён' : 'изменён';
-          titleEl.appendChild(badge);
-          badgeCount++;
-        }
+        const badge = document.createElement('span');
+        badge.className = 'revizorro-badge revizorro-badge--' + badgeType;
+        badge.textContent = badgeType === 'added' ? 'новый' : badgeType === 'removed' ? 'удалён' : 'изменён';
+        nameEl.insertAdjacentElement('afterend', badge);
+        badgeCount++;
       }
     }
 
@@ -737,7 +702,6 @@
   }
 
   function showDeletedFilesSummary(currentMap, previousMap) {
-    // Если плашка уже есть — не пересоздаём
     if (document.querySelector('.revizorro-deleted-summary')) return;
 
     const deletedFiles = [];
@@ -797,9 +761,7 @@
     }
   }
 
-  // ═══════════════════════════════════════════
-  // 5. MutationObserver для SPA
-  // ═══════════════════════════════════════════
+  // === MutationObserver для SPA ===
 
   function disconnectObserver() {
     if (observer) {
@@ -822,10 +784,8 @@
       for (const mutation of mutations) {
         for (const node of mutation.addedNodes) {
           if (node.nodeType !== 1) continue;
-          // Пропускаем наши собственные элементы
           if (node.classList?.contains('revizorro-injected') ||
               node.classList?.contains('revizorro-badge')) continue;
-          // Новый код в файле (НЕ отдельные code-line, только контейнеры)
           if (node.classList?.contains('source-tree__code') ||
               node.classList?.contains('source-tree__source') ||
               node.querySelector?.('.source-tree__code')) {
@@ -835,14 +795,12 @@
               delete fileEl.dataset.revizorroDiffApplied;
             }
           }
-          // Новые файлы/папки в дереве (при разворачивании папок)
           if (node.classList?.contains('source-tree__file') ||
               node.classList?.contains('source-tree__dir') ||
               node.querySelector?.('.source-tree__file')) {
             hasNewFiles = true;
           }
         }
-        // Удалены ноды с кодом — сбрасываем флаг
         for (const node of mutation.removedNodes) {
           if (node.nodeType === 1 && (
             node.classList?.contains('source-tree__code') ||
@@ -865,9 +823,7 @@
     observer.observe(mount, { childList: true, subtree: true });
   }
 
-  // ═══════════════════════════════════════════
-  // 6. Инициализация
-  // ═══════════════════════════════════════════
+  // === Инициализация ===
 
   function init() {
     pageData = extractPageData();

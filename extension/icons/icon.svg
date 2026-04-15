@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="100%" stop-color="#16213e"/>
+    </linearGradient>
+  </defs>
+  <!-- Маска Зорро — по центру, крупно -->
+  <g transform="translate(64,64) scale(1.6) translate(-64,-52)">
+    <path d="
+      M 12 52
+      C 12 42, 22 30, 40 28
+      C 48 27, 54 30, 60 36
+      L 64 40
+      L 68 36
+      C 74 30, 80 27, 88 28
+      C 106 30, 116 42, 116 52
+      C 116 62, 110 72, 100 76
+      C 94 78, 86 76, 80 70
+      L 64 54
+      L 48 70
+      C 42 76, 34 78, 28 76
+      C 18 72, 12 62, 12 52
+      Z
+    " fill="url(#g)" />
+    <ellipse cx="42" cy="52" rx="14" ry="11" fill="white"/>
+    <ellipse cx="42" cy="52" rx="8" ry="7" fill="#1a1a2e"/>
+    <ellipse cx="86" cy="52" rx="14" ry="11" fill="white"/>
+    <ellipse cx="86" cy="52" rx="8" ry="7" fill="#1a1a2e"/>
+    <path d="M 12 50 C 6 48, 2 44, 0 38" stroke="#1a1a2e" stroke-width="4" fill="none" stroke-linecap="round"/>
+    <path d="M 116 50 C 122 48, 126 44, 128 38" stroke="#1a1a2e" stroke-width="4" fill="none" stroke-linecap="round"/>
+  </g>
+</svg>
