@@ -14,60 +14,52 @@
 
   let currentFileMap = null;
   let previousFileMap = null;
-  let currentBySuffix = null;
-  let previousBySuffix = null;
-  let badgeMaps = null;
+  let currentByName = null;
+  let previousByName = null;
+  let suffixIndex = null;
 
   function buildFileMaps() {
     if (!pageData) return;
     currentFileMap = new Map();
-    currentBySuffix = new Map();
+    currentByName = new Map();
+    suffixIndex = new Map();
     for (const s of pageData.current) {
       currentFileMap.set(s.file, s.source);
-      currentBySuffix.set(s.file, s);
-    }
-    previousFileMap = new Map();
-    previousBySuffix = new Map();
-    if (pageData.previous) {
-      for (const s of pageData.previous) {
-        previousFileMap.set(s.file, s.source);
-        previousBySuffix.set(s.file, s);
-      }
-    }
-    badgeMaps = null;
-  }
-
-  function getBadgeMaps() {
-    if (badgeMaps) return badgeMaps;
-    const previousMap = new Map();
-    const previousByName = new Map();
-    if (pageData.previous) {
-      for (const s of pageData.previous) {
-        previousMap.set(s.file, s.source);
-        const name = s.file.split('/').pop();
-        if (!previousByName.has(name)) previousByName.set(name, []);
-        previousByName.get(name).push(s);
-      }
-    }
-    const currentMap = new Map();
-    const currentByName = new Map();
-    for (const s of pageData.current) {
-      currentMap.set(s.file, s.source);
       const name = s.file.split('/').pop();
       if (!currentByName.has(name)) currentByName.set(name, []);
       currentByName.get(name).push(s);
+      const idx = s.file.lastIndexOf('/');
+      if (idx >= 0) {
+        const suffix = s.file.substring(idx + 1);
+        if (!suffixIndex.has(suffix)) suffixIndex.set(suffix, []);
+        suffixIndex.get(suffix).push(s.file);
+      }
     }
-    badgeMaps = { previousMap, previousByName, currentMap, currentByName };
-    return badgeMaps;
+    previousFileMap = new Map();
+    previousByName = new Map();
+    if (pageData.previous) {
+      for (const s of pageData.previous) {
+        previousFileMap.set(s.file, s.source);
+        const name = s.file.split('/').pop();
+        if (!previousByName.has(name)) previousByName.set(name, []);
+        previousByName.get(name).push(s);
+        const idx = s.file.lastIndexOf('/');
+        if (idx >= 0) {
+          const suffix = s.file.substring(idx + 1);
+          if (!suffixIndex.has(suffix)) suffixIndex.set(suffix, []);
+          suffixIndex.get(suffix).push(s.file);
+        }
+      }
+    }
   }
 
   function invalidateCaches() {
     diffCache.clear();
     currentFileMap = null;
     previousFileMap = null;
-    currentBySuffix = null;
-    previousBySuffix = null;
-    badgeMaps = null;
+    currentByName = null;
+    previousByName = null;
+    suffixIndex = null;
   }
 
   // === Извлечение данных из страницы ===
@@ -393,12 +385,13 @@
     if (!currentFileMap) return null;
     if (currentFileMap.has(partialPath)) return partialPath;
     if (previousFileMap && previousFileMap.has(partialPath)) return partialPath;
-    for (const [path] of currentFileMap) {
-      if (path.endsWith('/' + partialPath)) return path;
-    }
-    if (previousFileMap) {
-      for (const [path] of previousFileMap) {
-        if (path.endsWith('/' + partialPath)) return path;
+    if (suffixIndex) {
+      const tail = partialPath.split('/').pop();
+      const candidates = suffixIndex.get(tail);
+      if (candidates) {
+        for (const path of candidates) {
+          if (path.endsWith('/' + partialPath)) return path;
+        }
       }
     }
     return null;
@@ -529,26 +522,27 @@
   // === Бейджи на папках и файлах ===
 
   function computeFolderStats() {
-    const { currentMap, previousMap } = getBadgeMaps();
+    if (!currentFileMap || !previousFileMap) return new Map();
     const stats = new Map();
 
     const bump = (filePath, type) => {
       const parts = filePath.split('/');
-      for (let depth = 1; depth < parts.length; depth++) {
-        const folder = parts.slice(0, depth).join('/');
+      let folder = '';
+      for (let depth = 0; depth < parts.length - 1; depth++) {
+        folder = depth === 0 ? parts[0] : folder + '/' + parts[depth];
         let s = stats.get(folder);
         if (!s) { s = { added: 0, modified: 0, removed: 0, deletedFiles: [] }; stats.set(folder, s); }
         s[type]++;
       }
     };
 
-    for (const [path, source] of currentMap) {
-      const prev = previousMap.get(path);
+    for (const [path, source] of currentFileMap) {
+      const prev = previousFileMap.get(path);
       if (prev === undefined) bump(path, 'added');
       else if (prev !== source) bump(path, 'modified');
     }
-    for (const [path] of previousMap) {
-      if (!currentMap.has(path)) {
+    for (const [path] of previousFileMap) {
+      if (!currentFileMap.has(path)) {
         bump(path, 'removed');
         // Добавляем имя файла только в непосредственную родительскую папку
         const lastSlash = path.lastIndexOf('/');
@@ -684,7 +678,7 @@
   function applyFileBadges() {
     if (!pageData || !pageData.previous) return;
 
-    const { previousMap, previousByName, currentMap, currentByName } = getBadgeMaps();
+    if (!currentFileMap || !previousFileMap) return;
 
     const fileElements = document.querySelectorAll('.source-tree__file');
     let badgeCount = 0;
@@ -703,8 +697,8 @@
       }
 
       if (!fullPath) {
-        const currentMatches = currentByName.get(fileName) || [];
-        const prevMatches = previousByName.get(fileName) || [];
+        const currentMatches = (currentByName && currentByName.get(fileName)) || [];
+        const prevMatches = (previousByName && previousByName.get(fileName)) || [];
         if (currentMatches.length === 1) {
           fullPath = currentMatches[0].file;
         } else if (prevMatches.length === 1) {
@@ -714,8 +708,8 @@
 
       if (!fullPath) continue;
 
-      const currentSource = currentMap.get(fullPath);
-      const previousSource = previousMap.get(fullPath);
+      const currentSource = currentFileMap.get(fullPath);
+      const previousSource = previousFileMap.get(fullPath);
 
       let badgeType = null;
       if (currentSource !== undefined && previousSource === undefined) {
