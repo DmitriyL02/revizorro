@@ -263,17 +263,25 @@
     label.className = 'revizorro-diff-label';
     label.textContent = 'Diff';
 
+    const hasHistory = !!(pageData && pageData.allIterations && pageData.allIterations.length > 0);
+
     const toggle = document.createElement('button');
     toggle.id = 'revizorro-diff-toggle';
     toggle.className = 'revizorro-toggle';
-    toggle.title = 'Показать/скрыть diff между итерациями';
+    toggle.title = hasHistory
+      ? 'Показать/скрыть diff между итерациями'
+      : 'Первая итерация — нечего сравнивать';
+    if (!hasHistory) {
+      toggle.disabled = true;
+      toggle.classList.add('revizorro-toggle--disabled');
+    }
 
     const select = document.createElement('select');
     select.id = 'revizorro-iteration-select';
     select.className = 'revizorro-select';
     select.title = 'Сравнить с итерацией...';
 
-    if (pageData && pageData.allIterations) {
+    if (hasHistory) {
       const iterations = pageData.allIterations;
       for (let i = 0; i < iterations.length; i++) {
         const iter = iterations[i];
@@ -286,6 +294,10 @@
         select.appendChild(option);
       }
     }
+
+    const firstIterHint = document.createElement('span');
+    firstIterHint.className = 'revizorro-first-iter-hint';
+    firstIterHint.textContent = 'первая итерация';
 
     select.addEventListener('change', () => {
       const idx = parseInt(select.value, 10);
@@ -300,6 +312,7 @@
     selectWrapper.appendChild(select);
 
     toggle.addEventListener('click', () => {
+      if (!hasHistory) return;
       diffEnabled = !diffEnabled;
       container.classList.toggle('revizorro-diff-container--active', diffEnabled);
       toggle.classList.toggle('revizorro-toggle--on', diffEnabled);
@@ -316,7 +329,11 @@
 
     container.appendChild(label);
     container.appendChild(toggle);
-    container.appendChild(selectWrapper);
+    if (hasHistory) {
+      container.appendChild(selectWrapper);
+    } else {
+      container.appendChild(firstIterHint);
+    }
 
     const insertButton = () => {
       const tabsGroup = document.querySelector('.tabs-group-default, .tabs-group');
@@ -341,6 +358,8 @@
         }
       }, 500);
     }
+
+    if (!hasHistory) return;
 
     try {
       chrome.storage.local.get(DIFF_ENABLED_KEY, (result) => {

@@ -61,6 +61,23 @@
   background: #3ec456;
 }
 
+.revizorro-toggle--disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.revizorro-toggle--disabled:hover {
+  background: #e0e0e0;
+}
+
+.revizorro-first-iter-hint {
+  font-size: 12px;
+  color: #999;
+  font-style: italic;
+  user-select: none;
+  margin-left: 4px;
+}
+
 .revizorro-select-wrapper {
   max-width: 0;
   opacity: 0;
