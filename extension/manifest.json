@@ -1,15 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Revizorro Diff",
-  "version": "0.1.0",
+  "version": "1.0.3",
   "description": "Подсветка diff между итерациями ревью на платформе Яндекс Практикум",
   "author": "Лацис Дмитрий",
   "homepage_url": "https://github.com/DmitriyL02/revizorro",
   "permissions": ["storage", "activeTab"],
   "content_scripts": [
     {
-      "matches": ["https://admin.praktikum.yandex-team.ru/office/revisor-review/*"],
-      "js": ["content.js"],
+      "matches": ["https://admin.praktikum.yandex-team.ru/office/*"],
+      "js": ["line-diff.js", "review-history.js", "content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"
     }

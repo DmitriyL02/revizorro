@@ -8,15 +8,51 @@
   let diffEnabled = false;
   let pageData = null;
   let diffCache = new Map();
+  const pendingDiffs = new Map();
+  let diffRevision = 0;
   let observer = null;
   let isApplyingDiff = false;
   let observerDebounceTimer = null;
+  let activeReviewUrl;
+  let navigationRevision = 0;
+  let navigationRequest = null;
+  let loadingReview = false;
+  let retryAt = Infinity;
+  let retryDelay = 2000;
+  let toggleMountTimer = null;
 
   let currentFileMap = null;
   let previousFileMap = null;
   let currentByName = null;
   let previousByName = null;
   let suffixIndex = null;
+
+  try {
+    chrome.runtime.onMessage.addListener((message, sender, respond) => {
+      if (message?.type !== 'revizorro-status') return;
+      respond({
+        ready: activeReviewUrl === currentReviewUrl() && !!pageData && !!document.getElementById('revizorro-diff-toggle'),
+        hasHistory: !!pageData?.allIterations?.length,
+        needsSelection: !!pageData?.allIterations?.length && !pageData.previous,
+        enabled: diffEnabled,
+      });
+    });
+  } catch (e) { /* context invalidated */ }
+
+  function alignPreviousRoot(current, previous) {
+    const singleRoot = sources => {
+      if (!sources.length) return null;
+      const root = sources[0].file.split('/')[0];
+      return root && sources.every(s => s.file.startsWith(root + '/')) ? root : null;
+    };
+    const currentRoot = singleRoot(current);
+    const previousRoot = singleRoot(previous);
+    if (!currentRoot || !previousRoot || currentRoot === previousRoot) return previous;
+    const relativePaths = new Set(current.map(s => s.file.slice(currentRoot.length + 1)));
+    if (!previous.some(s => relativePaths.has(s.file.slice(previousRoot.length + 1)))) return previous;
+    // Only the archive wrapper changes; nested paths retain their identity.
+    return previous.map(s => ({ ...s, file: currentRoot + s.file.slice(previousRoot.length) }));
+  }
 
   function buildFileMaps() {
     if (!pageData) return;
@@ -38,7 +74,7 @@
     previousFileMap = new Map();
     previousByName = new Map();
     if (pageData.previous) {
-      for (const s of pageData.previous) {
+      for (const s of alignPreviousRoot(pageData.current, pageData.previous)) {
         previousFileMap.set(s.file, s.source);
         const name = s.file.split('/').pop();
         if (!previousByName.has(name)) previousByName.set(name, []);
@@ -53,7 +89,13 @@
     }
   }
 
+  function cancelPendingDiffs() {
+    diffRevision++;
+    pendingDiffs.clear();
+  }
+
   function invalidateCaches() {
+    cancelPendingDiffs();
     diffCache.clear();
     currentFileMap = null;
     previousFileMap = null;
@@ -64,180 +106,95 @@
 
   // === Извлечение данных из страницы ===
 
-  function extractPageData() {
-    const scripts = document.querySelectorAll('script');
+  function readBootstrapObject(text, start) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < text.length; i++) {
+      const char = text[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') inString = true;
+      else if (char === '{') depth++;
+      else if (char === '}' && --depth === 0) {
+        // Bootstrap is JSON with undefined values. Preserve quoted source code;
+        // never evaluate JavaScript from the page.
+        const json = text.slice(start, i + 1).replace(
+          /"(?:\\.|[^"\\])*"|\bundefined\b/g,
+          token => token === 'undefined' ? 'null' : token
+        );
+        return JSON.parse(json);
+      }
+    }
+    throw new Error('Incomplete review bootstrap');
+  }
+
+  function extractPageData(root = document) {
+    const scripts = root.querySelectorAll('script');
     for (const script of scripts) {
       const text = script.textContent;
-      if (!text.includes('__init__.default(')) continue;
-
-      const marker = '__init__.default({}, ';
-      const startIdx = text.indexOf(marker);
-      if (startIdx < 0) continue;
-
-      const jsonStart = startIdx + marker.length;
-      let endIdx = text.lastIndexOf(', false)');
-      if (endIdx < 0) endIdx = text.lastIndexOf(', true)');
-      if (endIdx < 0) continue;
+      const modern = /\bwindow\.wirthAdminBootstrap\s*=\s*(?=\{)/.exec(text);
+      const marker = modern || /\b__init__\.default\s*\(\s*\{\s*\}\s*,\s*(?=\{)/.exec(text);
+      if (!marker) continue;
 
       try {
-        let jsonStr = text.substring(jsonStart, endIdx);
-        jsonStr = jsonStr.replace(/:\s*undefined/g, ': null');
-        jsonStr = jsonStr.replace(/,\s*undefined/g, ', null');
-
-        const data = JSON.parse(jsonStr);
-        if (!data.apiData) return null;
+        const bootstrap = readBootstrapObject(text, marker.index + marker[0].length);
+        const data = modern ? bootstrap.data : bootstrap;
+        if (!data || !data.apiData) continue;
 
         const homework = data.apiData.homework;
         const history = data.apiData.history;
         const currentReview = data.apiData.currentReview;
 
-        if (!homework || !homework.data || !homework.data.sources) return null;
+        if (!Array.isArray(homework?.data?.sources) || !homework.data.sources.every(s =>
+          s && typeof s.file === 'string' && typeof s.source === 'string')) continue;
 
         const currentSources = homework.data.sources;
         const iteration = currentReview ? currentReview.iteration : null;
 
-        const filteredHistory = [];
-        if (history) {
-          for (let i = 0; i < history.length; i++) {
-            const h = history[i];
-            if (!h.data || !h.data.sources) continue;
-            if (h.id === homework.id) {
-              if (DEBUG) console.log('[Revizorro Diff] history[' + i + '] совпадает с homework по id, пропускаю');
-              continue;
-            }
-            filteredHistory.push(h);
-          }
-        }
-
-        const previousSources = filteredHistory.length > 0 ? filteredHistory[0].data.sources : null;
-        if (DEBUG && previousSources) {
-          console.log('[Revizorro Diff] Предыдущая итерация: files=' + previousSources.length);
-        }
-
-        const allIterations = [];
-        for (let i = filteredHistory.length - 1; i >= 0; i--) {
-          allIterations.push({
-            historyEntry: filteredHistory[i],
-            label: `Итерация ${filteredHistory.length - i}`,
-          });
-        }
+        const { previous, allIterations } = globalThis.RevizorroReviewHistory.selectHistory(homework, history, currentReview);
 
         return {
           current: currentSources,
-          previous: previousSources,
+          previous,
           iteration: iteration,
           allIterations: allIterations,
         };
       } catch (e) {
         if (DEBUG) console.error('[Revizorro Diff] Ошибка парсинга данных:', e);
-        return null;
       }
     }
     return null;
   }
 
-  // === Diff-алгоритм (line-based LCS) ===
+  const { computeLineDiffAsync } = globalThis.RevizorroLineDiff;
 
-  function computeLineDiff(oldText, newText) {
-    const oldLines = (oldText || '').split('\n');
-    const newLines = (newText || '').split('\n');
-
-    const n = oldLines.length;
-    const m = newLines.length;
-
-    if (n === 0 && m === 0) return [];
-    if (n === 0) return newLines.map((l, i) => ({ type: 'added', line: l, newNum: i + 1 }));
-    if (m === 0) return oldLines.map((l, i) => ({ type: 'removed', line: l, oldNum: i + 1 }));
-
-    // Для больших файлов — приблизительный diff
-    if (n * m > 2_000_000) {
-      return simpleDiff(oldLines, newLines);
-    }
-
-    // LCS DP — rolling two rows, direction table for backtrack
-    let prev = new Uint32Array(m + 1);
-    let curr = new Uint32Array(m + 1);
-    const dir = new Array(n + 1);
-    for (let i = 0; i <= n; i++) {
-      dir[i] = new Uint8Array(m + 1);
-    }
-
-    for (let i = 1; i <= n; i++) {
-      curr.fill(0);
-      for (let j = 1; j <= m; j++) {
-        if (oldLines[i - 1] === newLines[j - 1]) {
-          curr[j] = prev[j - 1] + 1;
-          dir[i][j] = 2;
-        } else if (prev[j] >= curr[j - 1]) {
-          curr[j] = prev[j];
-          dir[i][j] = 0;
-        } else {
-          curr[j] = curr[j - 1];
-          dir[i][j] = 1;
-        }
-      }
-      const tmp = prev;
-      prev = curr;
-      curr = tmp;
-    }
-
-    const result = [];
-    let i = n, j = m;
-    while (i > 0 || j > 0) {
-      if (i > 0 && j > 0 && dir[i][j] === 2) {
-        result.push({ type: 'context', line: oldLines[i - 1], oldNum: i, newNum: j });
-        i--; j--;
-      } else if (j > 0 && (i === 0 || dir[i][j] === 1)) {
-        result.push({ type: 'added', line: newLines[j - 1], newNum: j });
-        j--;
-      } else {
-        result.push({ type: 'removed', line: oldLines[i - 1], oldNum: i });
-        i--;
-      }
-    }
-
-    return result.reverse();
-  }
-
-  function simpleDiff(oldLines, newLines) {
-    const oldSet = new Set(oldLines);
-    const newSet = new Set(newLines);
-    const result = [];
-
-    let oi = 0, ni = 0;
-    while (oi < oldLines.length || ni < newLines.length) {
-      if (oi < oldLines.length && ni < newLines.length && oldLines[oi] === newLines[ni]) {
-        result.push({ type: 'context', line: oldLines[oi], oldNum: oi + 1, newNum: ni + 1 });
-        oi++; ni++;
-      } else if (oi < oldLines.length && !newSet.has(oldLines[oi])) {
-        result.push({ type: 'removed', line: oldLines[oi], oldNum: oi + 1 });
-        oi++;
-      } else if (ni < newLines.length && !oldSet.has(newLines[ni])) {
-        result.push({ type: 'added', line: newLines[ni], newNum: ni + 1 });
-        ni++;
-      } else if (oi < oldLines.length) {
-        result.push({ type: 'removed', line: oldLines[oi], oldNum: oi + 1 });
-        oi++;
-      } else {
-        result.push({ type: 'added', line: newLines[ni], newNum: ni + 1 });
-        ni++;
-      }
-    }
-    return result;
-  }
-
-  function getDiffForFile(filename) {
+  async function getDiffForFile(filename) {
     if (diffCache.has(filename)) return diffCache.get(filename);
+    if (pendingDiffs.has(filename)) return pendingDiffs.get(filename);
     if (!currentFileMap || !previousFileMap) return null;
 
     const currentSource = currentFileMap.get(filename);
     const previousSource = previousFileMap.get(filename);
-
     if (currentSource === undefined && previousSource === undefined) return null;
 
-    const diff = computeLineDiff(previousSource || '', currentSource || '');
-    diffCache.set(filename, diff);
-    return diff;
+    const revision = diffRevision;
+    const isCancelled = () => revision !== diffRevision ||
+      (activeReviewUrl !== undefined && activeReviewUrl !== currentReviewUrl());
+    const pending = computeLineDiffAsync(previousSource || '', currentSource || '', { isCancelled });
+    pendingDiffs.set(filename, pending);
+    try {
+      const diff = await pending;
+      if (!diff || isCancelled()) return null;
+      diffCache.set(filename, diff);
+      return diff;
+    } finally {
+      if (pendingDiffs.get(filename) === pending) pendingDiffs.delete(filename);
+    }
   }
 
   // === UI — Toggle + селектор итерации ===
@@ -253,7 +210,8 @@
   }
 
   function createToggleButton() {
-    if (document.getElementById('revizorro-diff-toggle')) return;
+    if (document.getElementById('revizorro-diff-toggle') || toggleMountTimer) return;
+    const review = pageData;
 
     const container = document.createElement('div');
     container.id = 'revizorro-diff-container';
@@ -283,12 +241,21 @@
 
     if (hasHistory) {
       const iterations = pageData.allIterations;
+      if (!pageData.previous) {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Выберите версию для сравнения';
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        select.appendChild(placeholder);
+      }
       for (let i = 0; i < iterations.length; i++) {
         const iter = iterations[i];
         const option = document.createElement('option');
         option.value = i;
         option.textContent = 'vs ' + iter.label;
-        if (i === iterations.length - 1) {
+        option.title = iter.title || iter.label;
+        if (iter.historyEntry.data.sources === pageData.previous) {
           option.selected = true;
         }
         select.appendChild(option);
@@ -300,6 +267,7 @@
     firstIterHint.textContent = 'первая итерация';
 
     select.addEventListener('change', () => {
+      if (pageData !== review) return;
       const idx = parseInt(select.value, 10);
       const iter = pageData.allIterations[idx];
       if (iter) {
@@ -312,7 +280,7 @@
     selectWrapper.appendChild(select);
 
     toggle.addEventListener('click', () => {
-      if (!hasHistory) return;
+      if (!hasHistory || pageData !== review) return;
       diffEnabled = !diffEnabled;
       container.classList.toggle('revizorro-diff-container--active', diffEnabled);
       toggle.classList.toggle('revizorro-toggle--on', diffEnabled);
@@ -336,14 +304,17 @@
     }
 
     const insertButton = () => {
+      if (pageData !== review) return true;
       const tabsGroup = document.querySelector('.tabs-group-default, .tabs-group');
       if (tabsGroup) {
         tabsGroup.appendChild(container);
+        applyDiffToVisibleFiles();
         return true;
       }
       const reviewHeader = document.querySelector('.review-header');
       if (reviewHeader) {
         reviewHeader.appendChild(container);
+        applyDiffToVisibleFiles();
         return true;
       }
       return false;
@@ -352,9 +323,10 @@
     if (!insertButton()) {
       let attempts = 0;
       const maxAttempts = 20;
-      const waitForTabs = setInterval(() => {
+      toggleMountTimer = setInterval(() => {
         if (insertButton() || ++attempts >= maxAttempts) {
-          clearInterval(waitForTabs);
+          clearInterval(toggleMountTimer);
+          toggleMountTimer = null;
         }
       }, 500);
     }
@@ -363,7 +335,7 @@
 
     try {
       chrome.storage.local.get(DIFF_ENABLED_KEY, (result) => {
-        if (chrome.runtime.lastError) return;
+        if (chrome.runtime.lastError || pageData !== review) return;
         if (result[DIFF_ENABLED_KEY]) {
           diffEnabled = true;
           container.classList.add('revizorro-diff-container--active');
@@ -408,15 +380,18 @@
       const tail = partialPath.split('/').pop();
       const candidates = suffixIndex.get(tail);
       if (candidates) {
-        for (const path of candidates) {
-          if (path.endsWith('/' + partialPath)) return path;
-        }
+        const matches = [...new Set(candidates.filter(path => path.endsWith('/' + partialPath)))];
+        if (matches.length === 1) return matches[0];
       }
     }
     return null;
   }
 
   function applyDiffToVisibleFiles() {
+    if (activeReviewUrl !== undefined && activeReviewUrl !== currentReviewUrl()) {
+      syncReviewLocation();
+      return;
+    }
     if (!diffEnabled || !pageData || !pageData.previous) return;
     if (isApplyingDiff) return;
     isApplyingDiff = true;
@@ -436,7 +411,6 @@
       if (!codeArea) continue;
 
       const codeLines = codeArea.querySelectorAll('.source-tree__code-line:not(.revizorro-injected)');
-      if (codeLines.length === 0) continue;
 
       if (fileEl.dataset.revizorroDiffApplied === 'true') continue;
 
@@ -448,17 +422,36 @@
       if (DEBUG) console.log('[Revizorro Diff] Совпадение в данных:', fullPath);
       if (!fullPath) continue;
 
-      const diff = getDiffForFile(fullPath);
-      if (!diff) continue;
+      if (codeLines.length === 0 && currentFileMap.get(fullPath)) continue;
+      if (!diffCache.has(fullPath)) {
+        if (!pendingDiffs.has(fullPath)) {
+          getDiffForFile(fullPath).then(diff => {
+            if (diff) applyDiffToVisibleFiles();
+          }).catch(error => {
+            if (DEBUG) console.warn('[Revizorro Diff] Ошибка расчёта:', error);
+          });
+        }
+        continue;
+      }
+      const diff = diffCache.get(fullPath);
 
+      codeArea.querySelectorAll('.revizorro-injected').forEach(el => el.remove());
+      codeArea.querySelectorAll('.revizorro-line-added').forEach(el => el.classList.remove('revizorro-line-added'));
       applyDiffToCodeBlock(codeArea, codeLines, diff);
       fileEl.dataset.revizorroDiffApplied = 'true';
     }
 
     applyFileBadges();
+    applyDeletedFiles();
   }
 
   function applyDiffToCodeBlock(codeArea, codeLines, diff) {
+    if (codeLines.length === 0) {
+      for (const entry of diff) {
+        if (entry.type === 'removed') codeArea.appendChild(createRemovedLineElement(entry));
+      }
+      return;
+    }
     if (DEBUG) {
       const addedCount = diff.filter(d => d.type === 'added').length;
       const removedCount = diff.filter(d => d.type === 'removed').length;
@@ -500,6 +493,7 @@
 
       const removedEntries = removedBeforeLine.get(lineNum);
       if (removedEntries) {
+        removedBeforeLine.delete(lineNum);
         for (const removed of removedEntries) {
           const removedEl = createRemovedLineElement(removed);
           codeLine.parentElement.insertBefore(removedEl, codeLine);
@@ -605,8 +599,6 @@
     const stats = computeFolderStats();
     if (stats.size === 0) return;
 
-    document.querySelectorAll('.revizorro-deleted-summary').forEach(el => el.remove());
-
     const titleElements = document.querySelectorAll('.source-tree__folder-title');
     for (const titleEl of titleElements) {
       const folderPath = getFolderPath(titleEl);
@@ -614,9 +606,8 @@
 
       let s = stats.get(folderPath);
       if (!s) {
-        for (const [key, val] of stats) {
-          if (key.endsWith('/' + folderPath) || key === folderPath) { s = val; break; }
-        }
+        const matches = [...stats].filter(([key]) => key.endsWith('/' + folderPath));
+        if (matches.length === 1) s = matches[0][1];
       }
       if (!s || (s.added === 0 && s.modified === 0 && s.removed === 0)) continue;
 
@@ -654,46 +645,39 @@
         }
       }
 
-      // Виджет удалённых файлов — показываем когда папка раскрыта
-      if (s.deletedFiles && s.deletedFiles.length > 0) {
-        const folderContainer = titleEl.parentElement;
-        if (folderContainer && !folderContainer.querySelector('.revizorro-deleted-summary')) {
-          const firstFile = folderContainer.querySelector('.source-tree__file');
-          if (firstFile) {
-            const widget = createDeletedWidget(s.deletedFiles);
-            firstFile.parentElement.insertBefore(widget, firstFile);
-          }
-        }
-      }
     }
   }
 
-  function createDeletedWidget(fileNames) {
-    const container = document.createElement('div');
-    container.className = 'revizorro-deleted-summary revizorro-injected';
-
-    const list = document.createElement('div');
-    list.className = 'revizorro-deleted-list';
-    for (const name of fileNames) {
-      const item = document.createElement('div');
-      item.className = 'revizorro-deleted-item';
-      item.textContent = name;
-      list.appendChild(item);
+  function applyDeletedFiles() {
+    if (document.getElementById('revizorro-deleted-files')) return;
+    const deleted = [...previousFileMap].filter(([path]) => !currentFileMap.has(path))
+      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+    if (deleted.length === 0) return;
+    const anchor = document.querySelector('.source-tree') ||
+      document.getElementById('revizorro-diff-container')?.parentElement;
+    if (!anchor) return;
+    const panel = document.createElement('details');
+    panel.id = 'revizorro-deleted-files';
+    panel.className = 'revizorro-deleted-summary revizorro-injected';
+    const heading = document.createElement('summary');
+    heading.textContent = `Удалённые файлы (${deleted.length}) — относительно выбранной версии`;
+    panel.appendChild(heading);
+    for (const [path, source] of deleted) {
+      const item = document.createElement('details');
+      item.className = 'revizorro-deleted-file';
+      const title = document.createElement('summary');
+      title.textContent = path;
+      item.appendChild(title);
+      item.addEventListener('toggle', () => {
+        if (!item.open || item.querySelector('pre')) return;
+        const code = document.createElement('pre');
+        code.className = 'revizorro-deleted-source';
+        code.textContent = source;
+        item.appendChild(code);
+      });
+      panel.appendChild(item);
     }
-
-    const header = document.createElement('div');
-    header.className = 'revizorro-deleted-header';
-    const n = fileNames.length;
-    const deleted = (n % 10 === 1 && n % 100 !== 11) ? 'удалён' : 'удалено';
-    header.textContent = '\u2212 ' + n + ' ' + pluralFiles(n) + ' ' + deleted;
-    header.addEventListener('click', () => {
-      list.classList.toggle('revizorro-deleted-list--open');
-      header.classList.toggle('revizorro-deleted-header--open');
-    });
-
-    container.appendChild(header);
-    container.appendChild(list);
-    return container;
+    anchor.insertAdjacentElement('beforebegin', panel);
   }
 
   function applyFileBadges() {
@@ -720,11 +704,8 @@
       if (!fullPath) {
         const currentMatches = (currentByName && currentByName.get(fileName)) || [];
         const prevMatches = (previousByName && previousByName.get(fileName)) || [];
-        if (currentMatches.length === 1) {
-          fullPath = currentMatches[0].file;
-        } else if (prevMatches.length === 1) {
-          fullPath = prevMatches[0].file;
-        }
+        const paths = [...new Set([...currentMatches, ...prevMatches].map(s => s.file))];
+        if (paths.length === 1) fullPath = paths[0];
       }
 
       if (!fullPath) continue;
@@ -767,6 +748,7 @@
 
 
   function removeDiffHighlights() {
+    cancelPendingDiffs();
     isApplyingDiff = true;
     try {
       document.querySelectorAll('.revizorro-line-added').forEach(el => {
@@ -802,75 +784,120 @@
     const mount = document.getElementById('mount') || document.body;
 
     observer = new MutationObserver((mutations) => {
+      if (activeReviewUrl !== undefined && activeReviewUrl !== currentReviewUrl()) {
+        syncReviewLocation();
+        return;
+      }
       if (!diffEnabled || isApplyingDiff) return;
 
-      let hasNewCode = false;
-      let hasNewFiles = false;
+      const injected = '.revizorro-injected, .revizorro-badge';
+      const code = '.source-tree__code, .source-tree__source, .source-tree__code-line';
+      const tree = code + ', .source-tree__file, .source-tree__dir';
+      let changed = false;
       for (const mutation of mutations) {
-        for (const node of mutation.addedNodes) {
-          if (node.nodeType !== 1) continue;
-          if (node.classList?.contains('revizorro-injected') ||
-              node.classList?.contains('revizorro-badge')) continue;
-          if (node.classList?.contains('source-tree__code') ||
-              node.classList?.contains('source-tree__source') ||
-              node.querySelector?.('.source-tree__code')) {
-            hasNewCode = true;
-            const fileEl = node.closest?.('.source-tree__file');
-            if (fileEl) {
-              delete fileEl.dataset.revizorroDiffApplied;
-            }
-          }
-          if (node.classList?.contains('source-tree__file') ||
-              node.classList?.contains('source-tree__dir') ||
-              node.querySelector?.('.source-tree__file')) {
-            hasNewFiles = true;
-          }
+        const target = mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target;
+        if (target?.closest?.(injected)) continue;
+        const nodes = [...mutation.addedNodes, ...mutation.removedNodes].filter(node =>
+          !node.matches?.(injected));
+        if (mutation.type !== 'characterData' && nodes.length === 0) continue;
+
+        if (target?.closest?.(code)) {
+          const file = target.closest('.source-tree__file');
+          if (file) delete file.dataset.revizorroDiffApplied;
+          changed = true;
         }
-        for (const node of mutation.removedNodes) {
-          if (node.nodeType !== 1) continue;
-          if (node.classList?.contains('source-tree__code') ||
-              node.classList?.contains('source-tree__source')) {
-            const fileEl = mutation.target.closest?.('.source-tree__file');
-            if (fileEl) {
-              delete fileEl.dataset.revizorroDiffApplied;
-            }
-          }
-          if (node.classList?.contains('source-tree__file') ||
-              node.classList?.contains('source-tree__dir') ||
-              node.querySelector?.('.source-tree__file')) {
-            hasNewFiles = true;
+        for (const node of nodes) {
+          if (node.matches?.(tree) || node.querySelector?.(tree)) {
+            const file = node.closest?.('.source-tree__file') || target?.closest?.('.source-tree__file');
+            if (file) delete file.dataset.revizorroDiffApplied;
+            changed = true;
           }
         }
       }
-
-      if (hasNewCode || hasNewFiles) {
+      if (changed) {
         clearTimeout(observerDebounceTimer);
         observerDebounceTimer = setTimeout(applyDiffToVisibleFiles, 100);
       }
     });
 
-    observer.observe(mount, { childList: true, subtree: true });
+    observer.observe(mount, { childList: true, subtree: true, characterData: true });
   }
 
   // === Инициализация ===
 
-  function init() {
-    pageData = extractPageData();
+  function currentReviewUrl() {
+    return location.pathname.startsWith('/office/revisor-review/')
+      ? location.origin + location.pathname + location.search : null;
+  }
 
-    if (!pageData) {
-      if (DEBUG) console.log('[Revizorro Diff] Данные ревью не найдены на странице');
-      return;
-    }
-
-    if (DEBUG) {
-      if (!pageData.previous) {
-        console.log('[Revizorro Diff] Нет предыдущей итерации для сравнения');
-      }
-      console.log('[Revizorro Diff] Загружено: ' + pageData.current.length + ' файлов, ' + pageData.allIterations.length + ' итераций');
-    }
-
+  function installReview(data) {
+    pageData = data;
+    retryAt = Infinity;
+    retryDelay = 2000;
     buildFileMaps();
     createToggleButton();
+  }
+
+  async function loadReview(url, revision) {
+    loadingReview = true;
+    const controller = new AbortController();
+    navigationRequest = controller;
+    try {
+      const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store', signal: controller.signal });
+      if (!response.ok || response.url !== url) throw new Error('Review request failed or redirected');
+      const html = await response.text();
+      if (revision !== navigationRevision || currentReviewUrl() !== url) return;
+      const data = extractPageData(new DOMParser().parseFromString(html, 'text/html'));
+      if (!data) throw new Error('Review data unavailable');
+      installReview(data);
+    } catch (error) {
+      if (revision === navigationRevision && error.name !== 'AbortError') {
+        retryAt = Date.now() + retryDelay;
+        retryDelay = Math.min(retryDelay * 2, 60000);
+        if (DEBUG) console.warn('[Revizorro Diff] Не удалось обновить ревью:', error);
+      }
+    } finally {
+      if (revision === navigationRevision) {
+        loadingReview = false;
+        navigationRequest = null;
+      }
+    }
+  }
+
+  function syncReviewLocation(useInitialDocument = false) {
+    const url = currentReviewUrl();
+    if (url === activeReviewUrl) {
+      if (pageData) createToggleButton();
+      else if (url && !loadingReview && Date.now() >= retryAt) loadReview(url, navigationRevision);
+      return;
+    }
+    navigationRevision++;
+    navigationRequest?.abort();
+    navigationRequest = null;
+    loadingReview = false;
+    clearInterval(toggleMountTimer);
+    toggleMountTimer = null;
+    disconnectObserver();
+    removeDiffHighlights();
+    document.getElementById('revizorro-diff-container')?.remove();
+    pageData = null;
+    invalidateCaches();
+    activeReviewUrl = url;
+    retryDelay = 2000;
+    retryAt = Infinity;
+    if (!url) return;
+    // The original inline bootstrap belongs only to the initially loaded URL.
+    // SPA navigation fetches that review's HTML instead of reusing stale scripts.
+    const initialData = useInitialDocument === true ? extractPageData() : null;
+    if (initialData) installReview(initialData);
+    else loadReview(url, navigationRevision);
+  }
+
+  function init() {
+    syncReviewLocation(true);
+    window.addEventListener('popstate', () => syncReviewLocation());
+    // pushState in the page's isolated JS world emits no popstate event.
+    setInterval(() => syncReviewLocation(), 250);
   }
 
   if (document.readyState === 'loading') {
